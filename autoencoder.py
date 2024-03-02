@@ -1,5 +1,7 @@
 # Autoencoder Research Project
 # autoencoder.py
+#
+# Ven
 
 
 import os
@@ -17,10 +19,13 @@ import torch as tor
 import torch.nn as nn
 import torch.optim as opt
 from torch.utils.data import DataLoader, TensorDataset
+from torch.profiler import profile, record_function, ProfilerActivity
 import skorch as skr
 import seaborn as sea
 import matplotlib as mpl
-
+import psutil
+import json
+from pippy.IR import annotate_split_points, Pipe, PipeSplitWrapper, MultiUseParameterConfig, LossWrapper
 
 ################################################################
 # Config
@@ -93,14 +98,15 @@ pf = ppr.pformat
 ################################################################
 
 class Encoder(nn.Module):
-  def __init__(self, input_size, latent_dim):
+  def __init__(self, input_size, latent_dim, device):
     super(Encoder, self).__init__()
+    
     self.model = nn.Sequential(
-      nn.Linear(input_size, 128),
+      nn.Linear(input_size, 128, device=device),
       nn.LeakyReLU(0.2),
-      nn.Linear(128, 64),
+      nn.Linear(128, 64, device=device),
       nn.LeakyReLU(0.2),
-      nn.Linear(64, latent_dim)
+      nn.Linear(64, latent_dim, device=device)
     )
     
   def forward(self, x):
@@ -108,14 +114,15 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-  def __init__(self, latent_dim, output_size):
+  def __init__(self, latent_dim, output_size, device):
     super(Decoder, self).__init__()
+  
     self.model = nn.Sequential(
-      nn.Linear(latent_dim, 64),
+      nn.Linear(latent_dim, 64, device=device),
       nn.LeakyReLU(0.2),
-      nn.Linear(64, 128),
+      nn.Linear(64, 128, device=device),
       nn.LeakyReLU(0.2),
-      nn.Linear(128, output_size)
+      nn.Linear(128, output_size, device=device)
     )
     
   def forward(self, x):
@@ -123,14 +130,15 @@ class Decoder(nn.Module):
 
 
 class Discriminator(nn.Module):
-  def __init__(self, latent_dim):
+  def __init__(self, latent_dim, device):
     super(Discriminator, self).__init__()
+    
     self.model = nn.Sequential(
-      nn.Linear(latent_dim, 64),
+      nn.Linear(latent_dim, 64, device=device),
       nn.LeakyReLU(0.2),
-      nn.Linear(64, 32),
+      nn.Linear(64, 32, device=device),
       nn.LeakyReLU(0.2),
-      nn.Linear(32, latent_dim),
+      nn.Linear(32, latent_dim, device=device),
     )
     
   def forward(self, x):
@@ -138,29 +146,39 @@ class Discriminator(nn.Module):
 
 
 class Autoencoder(nn.Module):
-  def __init__(self, input_size, latent_size, output_size):
+  def __init__(self, input_size, latent_size, output_size, device):
     super(Autoencoder, self).__init__()
     
-    self.encoder = Encoder(input_size, latent_size)
-    self.decoder = Decoder(latent_size, output_size)
+    self.encoder = Encoder(input_size, latent_size, device)
+    self.decoder = Decoder(latent_size, output_size, device)
+
+    # Create layer labels.
+    setattr(self, f'1: encoder', self.encoder)
+    setattr(self, f'2: decoder', self.decoder)
 
   def forward(self, x):
-    x = self.encoder(x)
-    x = self.decoder(x)
+    x = getattr(self, f'1: encoder')(x)
+    x = getattr(self, f'2: decoder')(x)
     return x
 
 
 class AdvAutoencoder(nn.Module):
-  def __init__(self, input_size, latent_size, output_size):
+  def __init__(self, input_size, latent_size, output_size, device):
     super(AdvAutoencoder, self).__init__()
-    self.encoder = Encoder(input_size, latent_size)
-    self.decoder = Decoder(latent_size, output_size)
-    self.discriminator = Discriminator(latent_size)
+
+    self.encoder = Encoder(input_size, latent_size, device)
+    self.decoder = Decoder(latent_size, output_size, device)
+    self.discriminator = Discriminator(latent_size, device)
+
+    # Create layer labels.
+    setattr(self, f'1: encoder', self.encoder)
+    setattr(self, f'2: decoder', self.decoder)
+    setattr(self, f'3: discriminator', self.discriminator)
 
   def forward(self, x):
-    z = self.encoder(x)
-    reconstructed = self.decoder(z)
-    validity = self.discriminator(z)
+    z = getattr(self, f'1: encoder')(x)
+    reconstructed = getattr(self, f'2: decoder')(z)
+    validity = getattr(self, f'3: discriminator')(z)
     return reconstructed, validity
 
 
@@ -222,8 +240,8 @@ def plot_data(data, mode='categorical', feature='label'):
   mpl.pyplot.show()    
 
 
-def make_tensor(data):
-  return tor.tensor(data.values, dtype=tor.float32)
+def make_tensor(data, device):
+  return tor.tensor(data.values, dtype=tor.float32, device=device)
 
 
 def process_data(data):
@@ -301,8 +319,17 @@ def process_data(data):
 # Training
 ################################################################
 
-def train(data, model_type='basic', epochs=1, batch_size=64, latent_size=16, learning_rate=0.001):
-  data_tensor = make_tensor(data)
+def train(data,
+          model_type='basic', 
+          epochs=50, 
+          batch_size=64, 
+          latent_size=16, 
+          learning_rate=0.001,
+          device=tor.device('cpu'),
+          profiler=None,
+          use_data_parallel=False,
+          use_pipeline_parallel=False):
+  data_tensor = make_tensor(data, device)
   dataset = TensorDataset(data_tensor, data_tensor)
   data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
@@ -310,35 +337,112 @@ def train(data, model_type='basic', epochs=1, batch_size=64, latent_size=16, lea
   if model_type == 'basic':
     model = Autoencoder(input_size=data_tensor.shape[1],
                         latent_size=latent_size,
-                        output_size=data_tensor.shape[1])
+                        output_size=data_tensor.shape[1],
+                        device=device)
     print("Training basic autoencoder...")
   elif model_type == 'adver':
     model = AdvAutoencoder(input_size=data_tensor.shape[1],
                            latent_size=latent_size,
-                           output_size=data_tensor.shape[1])
-    print("Training adversarial autoencoder...")
+                           output_size=data_tensor.shape[1],
+                           device=device)
+    parallel_type=""
+    if use_data_parallel: 
+      parallel_type=" data parallel" 
+    if use_pipeline_parallel:
+      parallel_type=" pipeline parallel"
+    print(f"Training adversarial autoencoder{parallel_type}...")
   else:
     raise ValueError("Invalid model type specified")
+
+  model.to(device)
 
   # Criterion and optimizer
   criterion_reconstruction = nn.MSELoss()
   criterion_discriminator = nn.BCEWithLogitsLoss()
   optimizer = opt.Adam(model.parameters(), lr=learning_rate)
 
+  # Data Parallel
+  if use_data_parallel:
+    model = tor.nn.DataParallel(model)
+    model.to(device)
+
+  # Pipeline Parallel
+  if use_pipeline_parallel:
+    # Setup for torchrun (RANK is an Index for the
+    # Process, and WORLD_SIZE is total Processes).
+    tor.manual_seed(0)
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    
+    annotate_split_points(
+        model,
+        {
+          "2: decoder": PipeSplitWrapper.SplitPoint.BEGINNING,
+          "3: discriminator": PipeSplitWrapper.SplitPoint.BEGINNING
+        }
+    )
+
+    x = tor.randn(data_tensor.shape[1])
+    chunks = 1
+    sample = (x, )
+    pipe = Pipe.from_tracing(model, 
+                             chunks,
+                             example_args=sample)
+
+    device = tor.device('mps')
+    model.to(device)
+
+  peak_mem = 0
+  avg_peak_mem = 0
+  run_time = 0
+  avg_run_time = 0
+
+  device = tor.device("mps")
+  model.to(device)
+
   # Training loop
   for epoch in range(epochs):
+    start_epoch_time = time.time()
+    total_mem = 0
+    total_rloss = 0
+    total_dloss = 0
+    i = 0
+
+    if f'epoch_{epoch+1}' not in stats:
+      stats[f'epoch_{epoch+1}'] = {}
+
+    key = 'adver'
+    if use_data_parallel: 
+      key = 'adver_data' 
+    if use_pipeline_parallel:
+      key = 'adver_pipe' 
+
+    stats[f'epoch_{epoch+1}'][key] = {}
+
     for inputs, _ in data_loader:
+      # start_time = time.time()
+
       if model_type == 'basic':
         # Forward pass
         outputs = model(inputs)
         loss = criterion_reconstruction(outputs, inputs)  
+
+        peak_mem = tor.mps.current_allocated_memory() / (1024*1024)
+        peak_mem = psutil.virtual_memory().used / (1024*1024)
+        print(f"  Peak Mem = {peak_mem}")
 
         # Backward pass and optimize
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        print(f"Epoch [{epoch+1}/{epochs}], Loss: {loss.item():.4f}")
+        end_time = time.time()
+        run_time = end_time - start_time        
+
+        # print(f"Epoch [{epoch+1}/{epochs}], Loss: {loss.item():.4f}")
+        # print(f"  Loss: {loss.item()}")
+        # print(f"  Memory: {peak_mem:.2f}")
+        # print(f"  Time: {run_time:.5f}")
 
       elif model_type == 'adver':
         # Forward pass
@@ -346,17 +450,26 @@ def train(data, model_type='basic', epochs=1, batch_size=64, latent_size=16, lea
  
         # Reconstruction loss
         reconstruction_loss = criterion_reconstruction(reconstructed, inputs)
-
+        
         # Discriminator loss for real and fake samples
-        real_samples = tor.randn(batch_size, latent_size)  # Gaussian distribution
-        real_preds = model.discriminator(real_samples)
+        real_samples = tor.randn(batch_size, latent_size, device=device) # Gaussian distribution
+        if use_data_parallel:
+          real_preds = model.module.discriminator(real_samples)
+        else:
+          real_preds = model.discriminator(real_samples)
         real_loss = criterion_discriminator(real_preds, tor.ones_like(real_preds))
 
-        fake_preds = model.discriminator(validity.detach())
+        if use_data_parallel:
+          fake_preds = model.module.discriminator(validity.detach())
+        else:
+          fake_preds = model.discriminator(validity.detach())
         fake_loss = criterion_discriminator(fake_preds, tor.zeros_like(fake_preds))
 
         # Total discriminator loss
         discriminator_loss = (real_loss + fake_loss) / 2
+
+        # peak_mem = tor.mps.current_allocated_memory() / (1024*1024)
+        peak_mem = psutil.virtual_memory().used / (1024*1024)
 
         # Backpropagation for autoencoder
         optimizer.zero_grad()
@@ -368,9 +481,31 @@ def train(data, model_type='basic', epochs=1, batch_size=64, latent_size=16, lea
         discriminator_loss.backward()
         optimizer.step()
 
-        print(f"Epoch [{epoch+1}/{epochs}]")
-        print(f"  Reconstruction Loss: {reconstruction_loss.item()}")
-        print(f"  Discriminator Loss: {discriminator_loss.item()}")
+        total_mem += peak_mem
+        total_rloss += reconstruction_loss.item()
+        total_dloss += discriminator_loss.item()
+
+        # print(f"Epoch [{epoch+1}/{epochs}]")
+        # print(f"  Reconstruction Loss: {reconstruction_loss.item()}")
+        # print(f"  Discriminator Loss: {discriminator_loss.item()}")
+        # print(f"  Memory: {peak_mem:.2f}")
+        # print(f"  Time: {run_time:.5f}")
+
+        i += 1
+
+    end_epoch_time = time.time()
+    epoch_time = end_epoch_time - start_epoch_time
+
+    avg_mem = total_mem / i
+    avg_rloss = total_rloss / i
+    avg_dloss = total_dloss / i
+
+    stats[f'epoch_{epoch+1}'][key]['time'] = epoch_time
+    stats[f'epoch_{epoch+1}'][key]['mem'] = avg_mem
+    stats[f'epoch_{epoch+1}'][key]['rloss'] = avg_rloss
+    stats[f'epoch_{epoch+1}'][key]['dloss'] = avg_dloss
+
+    print(stats[f'epoch_{epoch+1}'])
 
   return model
 
@@ -395,6 +530,11 @@ def results():
 # Main
 ################################################################
    
+stats = {}
+
+# Check if M1 GPU (or MPS) is available
+device = tor.device("mps" if tor.backends.mps.is_available() else "cpu")
+
 def main():
   print()
   print("----------------------------------------------------------------")
@@ -404,8 +544,6 @@ def main():
   print(f"Starting run at {run_time}...")
   print()
 
-  # Check if M1 GPU (or MPS) is available
-  device = tor.device("mps" if tor.backends.mps.is_available() else "cpu")
   print("Running on device...")
   print(device)
   print()
@@ -439,15 +577,36 @@ def main():
   print(data_anomaly.info())
   print()
 
-  model_basic = train(data_normal_train, model_type='basic')
-  print()
-  print("Saving basic autoencoder model...")
-  tor.save(model_basic, model_file_basic_ae)
+  # Store stats for each training run for reporting and graphs.
+  model_basic_stats = {}
+  model_adver_stats = {}
 
-  model_adver = train(data_normal_train, model_type='adver')
+  # model_basic = train(data_normal_train, model_type='basic')
+  # print()
+  # print("Saving basic autoencoder model...")
+  # tor.save(model_basic, model_file_basic_ae)
+
+  model_adver = train(data_normal_train, 
+                      model_type='adver',
+                      device=device)
+  model_adver = train(data_normal_train, 
+                      model_type='adver',
+                      device=device,
+                      use_data_parallel=True)
+  model_adver = train(data_normal_train, 
+                      model_type='adver',
+                      device=device,
+                      use_pipeline_parallel=True)
+
   print()
   print("Saving adversarial autoencoder model...")
   tor.save(model_adver, model_file_adver_ae)
+
+  print()
+  print("Saving stats...")
+
+  with open("stats.json", "w") as file:
+    json.dump(stats, file)        
 
   test()
   results()
@@ -461,7 +620,7 @@ def main():
   print("----------------------------------------------------------------")
   print()
 
-    
+  
 if __name__ == "__main__":
   main()
 
